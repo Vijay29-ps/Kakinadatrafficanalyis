@@ -29,9 +29,9 @@ except Exception:
 
 # --- CONFIG ---
 OUTPUT_DIR = Path("./outputs"); OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-MODELS_DIR = Path("./models"); MODELS_DIR.mkdir(parents=True, exist_ok=True)
+MODELS_DIR = Path("./model"); MODELS_DIR.mkdir(parents=True, exist_ok=True)
 GENERAL_MODEL_PATH = "yolov8n.pt"  # let Ultralytics download if missing
-HELMET_CANDIDATES = [MODELS_DIR / "best.pt", Path("/mnt/data/best.pt"), Path("./best.pt")]
+HELMET_CANDIDATES = [MODELS_DIR / "best.pt", Path("/mnt/data/best.pt"), Path("")]
 
 PX_PER_METER = 20.0
 OVERSPEED_THRESHOLD_KMPH = 40.0
