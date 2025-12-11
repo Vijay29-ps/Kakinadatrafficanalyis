@@ -1,56 +1,66 @@
-# main.py - Single-file FastAPI server with integrated YOLO processing (video/image -> annotated + deduped outputs)
-# Usage:
-#   pip install fastapi "uvicorn[standard]" python-multipart ultralytics opencv-python-headless numpy webcolors aiofiles
-#   uvicorn main:app --host 0.0.0.0 --port 7860
-#
-# Endpoint:
-#   POST /process  (multipart file upload field name "file", optional form field "camera_id")
-#   Returns: application/zip containing annotated output + results CSV + result JSON + summary JSON
+# app.py - Final single-file FastAPI server for HF Space
+# Paste into your Space repo root as app.py, commit & rebuild the Space.
+# Requirements: same as requirements.txt you used earlier.
 
 import os
-import io
-import time
+# ensure Ultralytics config dir is writable before importing ultralytics
+os.environ.setdefault("YOLO_CONFIG_DIR", os.environ.get("YOLO_CONFIG_DIR", "/app/.ultralytics"))
+from pathlib import Path
 import shutil
-import zipfile
-import tempfile
+import time
 import math
 import uuid
 import csv
 import json
-from pathlib import Path
+import tempfile
+import zipfile
 from collections import defaultdict, deque
 from datetime import datetime
 
+# Set up the writable dir
+Path(os.environ["YOLO_CONFIG_DIR"]).mkdir(parents=True, exist_ok=True)
+
+# standard libs for server
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
+# third-party
 import numpy as np
 import cv2
 import webcolors
+import requests
 
-# ultralytics YOLO
+# ultralytics - import after YOLO_CONFIG_DIR set
 from ultralytics import YOLO
 
-# ------------------ CONFIG (tweak) ------------------
+# optional huggingface hub download
+try:
+    from huggingface_hub import hf_hub_download
+except Exception:
+    hf_hub_download = None
+
+# ------------- CONFIG -------------
 OUTPUT_DIR = Path("./outputs")
-OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# models (you can place your helmet model here)
-GENERAL_MODEL_PATH = "./models/yolov8n.pt"   # if not present, ultralytics will download from the internet
-HELMET_MODEL_CANDIDATES = [Path("./models/best.pt"), Path("/app/models/best.pt"), Path("https://huggingface.co/spaces/psv12/Kakinadatrafficanalyis/resolve/main/best.pt")]
+GENERAL_MODEL_PATH = "./models/yolov8n.pt"  # fallback to 'yolov8n.pt' if not present
+HELMET_MODEL_CANDIDATES = [
+    Path("./models/best.pt"),
+    Path("/app/models/best.pt"),
+    Path("/mnt/data/best.pt"),
+    Path("./best.pt"),
+    Path("/app/best.pt"),
+]
 
-# detection/tracking/speed settings
 PX_PER_METER = 20.0
 OVERSPEED_THRESHOLD_KMPH = 40.0
 MAX_MATCH_DISTANCE_PX = 120
 TRACK_HISTORY_LEN = 6
 SPEED_SMOOTH_ALPHA = 0.4
-
 NUM_LANES = 3
 DENSITY_THRESHOLDS = {"none": 0, "low": 5, "medium": 15}
-
-KEEP_BY = "best_conf"  # dedupe mode
+KEEP_BY = "best_conf"
 
 CSV_HEADERS = [
     "file_name","camera_id","frame_id","vehicle_id",
@@ -59,15 +69,13 @@ CSV_HEADERS = [
     "violation_type","violation_image","timestamp","meta","crowd_count","density_level"
 ]
 
-# CORS - add your frontend origin(s)
 ALLOWED_ORIGINS = [
     "https://video-ten-silk.vercel.app",
     "http://localhost:3000",
     "http://127.0.0.1:3000"
 ]
 
-# ------------------ HELPERS (from your Colab) ------------------
-
+# ------------- UTILITIES -------------
 def make_vehicle_id():
     return str(uuid.uuid4())
 
@@ -108,13 +116,11 @@ def mean_color_hex(img, bbox, center_ratio=0.6, min_sat=30, min_val=40, k=3, max
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
     h_ch, s_ch, v_ch = cv2.split(hsv)
     mask = (s_ch >= min_sat) & (v_ch >= min_val)
-    # mask selection
     valid = crop[mask]
     if valid.shape[0] < 50:
         mask2 = (s_ch >= max(10, min_sat//2)) & (v_ch >= max(20, min_val//2))
         valid = crop[mask2]
     if valid.shape[0] < 30:
-        # fallback average central area
         fcrop = img[max(0, cy1 + int(0.2*(cy2-cy1))):max(0, cy2 - int(0.2*(cy2-cy1))),
                     max(0, cx1 + int(0.2*(cx2-cx1))):max(0, cx2 - int(0.2*(cx2-cx1)))]
         if fcrop.size == 0:
@@ -256,35 +262,104 @@ def build_record(file_name, camera_id, frame_id, vehicle_id, vehicle_type, conf,
     }
     return record
 
-# ------------------ MODEL LOADING ------------------
+# ------------- SAFE MODELS DIR CREATION & AUTO-COPY -------------
+# If a file named 'models' exists (not directory) rename it so we can create a directory
+models_path = Path("./models")
+if models_path.exists() and not models_path.is_dir():
+    backup = Path("./models.bak")
+    idx = 1
+    while backup.exists():
+        backup = Path(f"./models.bak.{idx}")
+        idx += 1
+    shutil.move(str(models_path), str(backup))
+    print(f"WARNING: Renamed existing file './models' -> '{backup.name}' to create models/ directory.")
+
+# create models dir
+models_path.mkdir(parents=True, exist_ok=True)
+
+# If uploaded file present at /mnt/data/best.pt copy it to ./models/best.pt
+mnt_model = Path("/mnt/data/best.pt")
+local_model = Path("./models/best.pt")
+if mnt_model.exists() and not local_model.exists():
+    try:
+        shutil.copy(str(mnt_model), str(local_model))
+        print("✔ Copied /mnt/data/best.pt -> ./models/best.pt")
+    except Exception as e:
+        print("Failed to copy /mnt/data/best.pt:", e)
+
+# ------------- MODEL LOADING -------------
+def ensure_helmet_model():
+    """
+    Returns path string to helmet model if found or downloaded, else None.
+    It checks local candidates, optional HELMET_MODEL_URL, or HuggingFace Hub repo.
+    """
+    # check candidates
+    for cand in HELMET_MODEL_CANDIDATES:
+        try:
+            if cand.exists():
+                return str(cand)
+        except Exception:
+            continue
+
+    # try HELMET_MODEL_URL
+    url = os.environ.get("HELMET_MODEL_URL")
+    if url:
+        try:
+            dest = Path("./models/best.pt")
+            print("Downloading helmet model from URL:", url)
+            r = requests.get(url, stream=True, timeout=300)
+            r.raise_for_status()
+            with open(dest, "wb") as f:
+                for chunk in r.iter_content(1024*1024):
+                    if chunk:
+                        f.write(chunk)
+            return str(dest)
+        except Exception as e:
+            print("Failed to download helmet model from URL:", e)
+
+    # try HF Hub
+    hf_repo = os.environ.get("HELMET_HF_REPO")
+    hf_filename = os.environ.get("HELMET_HF_FILENAME", "best.pt")
+    if hf_repo and hf_hub_download is not None:
+        try:
+            token = os.environ.get("HF_TOKEN")
+            print("Downloading helmet model from HF Hub:", hf_repo, hf_filename)
+            path = hf_hub_download(repo_id=hf_repo, filename=hf_filename, use_auth_token=token)
+            dest = Path("./models") / hf_filename
+            shutil.copy(path, dest)
+            return str(dest)
+        except Exception as e:
+            print("HF Hub download failed:", e)
+
+    return None
 
 def load_models():
-    # ensure models dir exists
-    Path("./models").mkdir(parents=True, exist_ok=True)
+    # ensure models directory exists (already handled above)
     gen_path = GENERAL_MODEL_PATH
     if not Path(gen_path).exists():
-        # fall back to default name (ultralytics will download)
-        gen_path = "yolov8n.pt"
+        gen_path = "yolov8n.pt"  # allow ultralytics to download default if missing
+
     print("Loading general model:", gen_path)
     general = YOLO(gen_path)
+
+    helmet_path = ensure_helmet_model()
     helmet = None
-    for cand in HELMET_MODEL_CANDIDATES:
-        if cand.exists():
-            try:
-                print("Found helmet model at", str(cand), "— loading automatically.")
-                helmet = YOLO(str(cand))
-                print("✔ Helmet model loaded:", str(cand))
-                break
-            except Exception as e:
-                print("Helmet model load failed for", cand, ":", e)
-    if helmet is None:
+    if helmet_path:
+        try:
+            print("Found helmet model at", helmet_path, "— loading automatically.")
+            helmet = YOLO(helmet_path)
+            print("✔ Helmet model loaded:", helmet_path)
+        except Exception as e:
+            print("Failed to load helmet model at", helmet_path, ":", e)
+            helmet = None
+    else:
         print("No helmet model auto-found. Helmet detection disabled.")
+
     return general, helmet
 
 GENERAL_MODEL, HELMET_MODEL = load_models()
 
-# ------------------ PROCESSING FUNCTIONS ------------------
-
+# ------------- PROCESSING (image/video) -------------
 def process_image(path, camera_id="camera_0"):
     img = cv2.imread(path)
     if img is None:
@@ -489,7 +564,8 @@ def process_video(path, camera_id="camera_0"):
     finally:
         cap.release()
         writer.release()
-    # dedupe by vehicle_id (track)
+
+    # dedupe
     dedup_map = {}
     for r in all_records:
         vid = r['vehicle_id']
@@ -502,6 +578,7 @@ def process_video(path, camera_id="camera_0"):
             else:
                 pass
     deduped_records = list(dedup_map.values())
+
     csv_path = OUTPUT_DIR / f"results_{ts}.csv"
     with open(csv_path, "w", newline='', encoding="utf-8") as cf:
         writer = csv.DictWriter(cf, fieldnames=CSV_HEADERS)
@@ -520,9 +597,8 @@ def process_video(path, camera_id="camera_0"):
         json.dump(summary, sf, indent=2)
     return str(out_vid_path), str(json_path), str(csv_path), str(summary_path)
 
-# ------------------ FASTAPI APP ------------------
-
-app = FastAPI(title="Helmet+Vehicle Processor (single-file)")
+# ------------- FASTAPI APP -------------
+app = FastAPI(title="Helmet+Vehicle Processor")
 
 app.add_middleware(
     CORSMiddleware,
@@ -534,41 +610,39 @@ app.add_middleware(
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "general_model": getattr(GENERAL_MODEL, "model", "yolo").__class__.__name__ if GENERAL_MODEL else None, "helmet_loaded": HELMET_MODEL is not None}
+    return {
+        "status": "ok",
+        "helmet_loaded": HELMET_MODEL is not None,
+        "yolo_config_dir": os.environ.get("YOLO_CONFIG_DIR"),
+        "general_model": getattr(GENERAL_MODEL, "model", None).__class__.__name__ if GENERAL_MODEL else None
+    }
 
 @app.post("/process")
 async def process(file: UploadFile = File(...), camera_id: str = Form("camera_0")):
-    # save uploaded file to a temp dir
     suffix = Path(file.filename).suffix.lower()
     tmpdir = Path(tempfile.mkdtemp())
     try:
         input_path = tmpdir / file.filename
         with open(input_path, "wb") as f:
-            content = await file.read()
-            f.write(content)
+            f.write(await file.read())
         is_image = suffix in (".jpg", ".jpeg", ".png", ".bmp", ".webp")
-        # process
         if is_image:
             out_img, out_json, out_csv, out_summary = process_image(str(input_path), camera_id=camera_id)
             files_to_zip = [out_img, out_json, out_csv, out_summary]
         else:
             out_vid, out_json, out_csv, out_summary = process_video(str(input_path), camera_id=camera_id)
             files_to_zip = [out_vid, out_json, out_csv, out_summary]
-        # make zip
+
         zip_name = OUTPUT_DIR / f"results_{int(time.time()*1000)}.zip"
         with zipfile.ZipFile(zip_name, "w", zipfile.ZIP_DEFLATED) as zf:
             for p in files_to_zip:
                 if p and Path(p).exists():
                     zf.write(p, arcname=Path(p).name)
-        # return zip
         return FileResponse(path=str(zip_name), filename=Path(zip_name).name, media_type="application/zip")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        # cleanup tempdir
         try:
             shutil.rmtree(tmpdir)
         except Exception:
             pass
-
-# ------------------ END ------------------
