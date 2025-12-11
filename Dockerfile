@@ -23,7 +23,7 @@ RUN pip install -r /app/requirements.txt
 RUN mkdir -p /app/models /app/outputs
 
 # Copy application code
-COPY main.py /app/main.py
+COPY app.py /app/app.py
 
 # Expose port expected by HF Spaces (7860) and general usage
 EXPOSE 7860
