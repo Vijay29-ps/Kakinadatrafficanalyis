@@ -46,8 +46,8 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 GENERAL_MODEL_PATH = "./models/yolov8n.pt"  # fallback to 'yolov8n.pt' if not present
 HELMET_MODEL_CANDIDATES = [
-    Path("./models/best.pt"),
-    Path("/app/models/best.pt"),
+    Path("./model/best.pt"),
+    Path("/app/model/best.pt"),
     Path("/mnt/data/best.pt"),
     Path("./best.pt"),
     Path("/app/best.pt"),
