@@ -19,16 +19,14 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --upgrade pip setuptools wheel
 RUN pip install -r /app/requirements.txt
 
-# Create models and outputs directories (optional)
+# Create directories
 RUN mkdir -p /app/models /app/outputs
 
 # Copy application code
 COPY main.py /app/main.py
 
-# If you want to embed model weights as part of the image, uncomment and copy them:
-# COPY models/*.pt /app/models/
-
+# Expose port expected by HF Spaces (7860) and general usage
 EXPOSE 7860
 
-# Use a simple command to run uvicorn on port 7860 (required by HF Spaces Docker)
+# Start the service
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "7860", "--workers", "1"]
