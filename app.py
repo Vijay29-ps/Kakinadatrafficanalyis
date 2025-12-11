@@ -38,7 +38,7 @@ OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
 
 # models (you can place your helmet model here)
 GENERAL_MODEL_PATH = "./models/yolov8n.pt"   # if not present, ultralytics will download from the internet
-HELMET_MODEL_CANDIDATES = [Path("./models/best.pt"), Path("/app/models/best.pt"), Path("/content/best.pt")]
+HELMET_MODEL_CANDIDATES = [Path("./models/best.pt"), Path("/app/models/best.pt"), Path("https://huggingface.co/spaces/psv12/Kakinadatrafficanalyis/resolve/main/best.pt")]
 
 # detection/tracking/speed settings
 PX_PER_METER = 20.0
