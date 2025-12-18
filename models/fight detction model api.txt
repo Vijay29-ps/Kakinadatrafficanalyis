@@ -1,0 +1,11 @@
+from inference_sdk import InferenceHTTPClient
+
+CLIENT = InferenceHTTPClient(
+    api_url="https://serverless.roboflow.com",
+    api_key="cpaeqLTV1297wQM8mZbx"
+)
+
+result = CLIENT.infer(your_image.jpg, model_id="fight-9uyg7/1")
+
+
+https://universe.roboflow.com/ai-test-ucvqr/fight-9uyg7/model/1
