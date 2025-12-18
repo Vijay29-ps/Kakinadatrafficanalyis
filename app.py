@@ -1,10 +1,14 @@
+# app.py — FINAL FastAPI entrypoint for HF Spaces
 import os
 import uuid
 import shutil
 import cv2
-from fastapi import FastAPI, UploadFile, File
+from pathlib import Path
+
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 
+# ----------------- PIPELINE IMPORTS -----------------
 from pipeline.vehicle_tracker import VehicleTracker
 from pipeline.helmet_detector import HelmetDetector
 from pipeline.weapon_detector import WeaponDetector
@@ -17,9 +21,14 @@ from utils.csv_logger import init_csv, log_event
 from utils.dedup import EventDeduplicator
 from utils.drawing import draw_box
 
-app = FastAPI(title="Traffic AI Analytics System")
+# ----------------- FASTAPI APP -----------------
+app = FastAPI(
+    title="Traffic AI Analytics – FastAPI",
+    description="Vehicle, Helmet, Weapon, Fight, Speed analytics",
+    version="1.0"
+)
 
-# ------------------ LOAD MODELS ONCE ------------------
+# ----------------- LOAD MODELS ONCE (IMPORTANT) -----------------
 vehicle_tracker = VehicleTracker()
 helmet_detector = HelmetDetector()
 weapon_detector = WeaponDetector()
@@ -28,34 +37,47 @@ speed_estimator = SpeedEstimator()
 event_manager = EventManager()
 dedup = EventDeduplicator()
 
-# -----------------------------------------------------
+# ----------------- HEALTH CHECK -----------------
+@app.get("/")
+def health():
+    return {"status": "running", "service": "Traffic AI FastAPI"}
 
+# ----------------- MAIN ANALYSIS ENDPOINT -----------------
 @app.post("/analyze")
 async def analyze_video(file: UploadFile = File(...)):
-    video_id = str(uuid.uuid4())[:8]
-    input_path = OUTPUT_DIR / f"input_{video_id}.mp4"
-    output_path = OUTPUT_DIR / f"output_{video_id}.mp4"
-    csv_path = OUTPUT_DIR / f"events_{video_id}.csv"
+    if not file.filename.lower().endswith((".mp4", ".avi", ".mov", ".mkv", ".webm")):
+        raise HTTPException(status_code=400, detail="Unsupported video format")
 
+    run_id = str(uuid.uuid4())[:8]
+
+    input_path = OUTPUT_DIR / f"input_{run_id}.mp4"
+    output_path = OUTPUT_DIR / f"output_{run_id}.mp4"
+    csv_path = OUTPUT_DIR / f"events_{run_id}.csv"
+
+    # Save uploaded file
     with open(input_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
     cap = cv2.VideoCapture(str(input_path))
+    if not cap.isOpened():
+        raise HTTPException(status_code=500, detail="Cannot open video")
+
     fps = cap.get(cv2.CAP_PROP_FPS) or 25
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
     writer = cv2.VideoWriter(
         str(output_path),
         cv2.VideoWriter_fourcc(*"mp4v"),
         fps,
-        (w, h)
+        (width, height)
     )
 
     init_csv(csv_path)
     frame_id = 0
 
-    while cap.isOpened():
+    # ----------------- SINGLE VIDEO LOOP -----------------
+    while True:
         ret, frame = cap.read()
         if not ret:
             break
@@ -64,40 +86,40 @@ async def analyze_video(file: UploadFile = File(...)):
 
         tracks = vehicle_tracker.process_frame(frame)
 
-        for t in tracks:
-            track_id = t["track_id"]
-            bbox = t["bbox"]
-            cls = t["class_name"]
+        for track in tracks:
+            track_id = track["track_id"]
+            bbox = track["bbox"]
+            cls_name = track["class_name"]
 
-            # Helmet check
-            helmet = helmet_detector.check(frame, t)
-
-            # Weapon + fight
-            weapon = weapon_detector.check(frame, t)
-            fight = fight_detector.check(frame, t)
-
-            # Speed
-            speed = speed_estimator.update(track_id, bbox)
+            helmet = helmet_detector.check(frame, track)
+            weapon = weapon_detector.check(frame, track)
+            fight  = fight_detector.check(frame, track)
+            speed  = speed_estimator.update(track_id, bbox)
 
             events = event_manager.fuse(
-                track_id, cls, helmet, weapon, fight, speed
+                track=track,
+                helmet=helmet,
+                weapon=weapon,
+                fight=fight,
+                speed=speed
             )
 
-            for e in events:
-                if dedup.allow(f"{track_id}-{e['type']}"):
+            for ev in events:
+                dedup_key = f"{track_id}-{ev['type']}"
+                if dedup.allow(dedup_key):
                     log_event(csv_path, [
                         frame_id,
-                        e["type"],
+                        ev["type"],
                         track_id,
-                        e["confidence"],
-                        e["details"]
+                        ev["confidence"],
+                        ev["details"]
                     ])
 
                 draw_box(
                     frame,
                     bbox,
-                    e["label"],
-                    e["color"]
+                    ev["label"],
+                    ev["color"]
                 )
 
         writer.write(frame)
@@ -105,16 +127,26 @@ async def analyze_video(file: UploadFile = File(...)):
     cap.release()
     writer.release()
 
-    return {
+    return JSONResponse({
         "status": "success",
-        "video": f"/download/video/{output_path.name}",
-        "csv": f"/download/csv/{csv_path.name}"
-    }
+        "run_id": run_id,
+        "outputs": {
+            "video": f"/download/video/{output_path.name}",
+            "csv": f"/download/csv/{csv_path.name}"
+        }
+    })
 
+# ----------------- DOWNLOAD ENDPOINTS -----------------
 @app.get("/download/video/{filename}")
 def download_video(filename: str):
-    return FileResponse(OUTPUT_DIR / filename, media_type="video/mp4")
+    path = OUTPUT_DIR / filename
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(path, media_type="video/mp4")
 
 @app.get("/download/csv/{filename}")
 def download_csv(filename: str):
-    return FileResponse(OUTPUT_DIR / filename, media_type="text/csv")
+    path = OUTPUT_DIR / filename
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(path, media_type="text/csv")
