@@ -3,7 +3,7 @@ from utils.config import MODEL_DIR
 
 class WeaponDetector:
     def __init__(self):
-        self.model = YOLO(str(MODEL_DIR / "All_weapon.pt"))
+        self.model = YOLO(str(MODEL_DIR / "All_weapon .pt"))
 
     def check(self, frame, track):
         res = self.model(frame, verbose=False)
