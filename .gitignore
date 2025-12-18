@@ -1,7 +1,6 @@
 __pycache__/
-outputs/
-models/*.pt
-.vscode/
+*.mp4
+*.csv
+*.json
 .env
-*.pyc
-*.log
+outputs/*
