@@ -1,68 +1,38 @@
 import os
-import sys
 import uuid
 import shutil
 import cv2
 from pathlib import Path
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-# ------------------------------------------------------------------
-# Environment fixes for Hugging Face
-# ------------------------------------------------------------------
 os.environ["YOLO_CONFIG_DIR"] = "/tmp/Ultralytics"
 
-BASE_DIR = Path(__file__).resolve().parent
-sys.path.append(str(BASE_DIR))
-
-# ------------------------------------------------------------------
-# Project imports
-# ------------------------------------------------------------------
 from pipeline.vehicle_tracker import VehicleTracker
 from pipeline.helmet_detector import HelmetDetector
 from pipeline.weapon_detector import WeaponDetector
 from pipeline.fight_detector import FightDetector
 from pipeline.event_manager import EventManager
 
-from utils.config import OUTPUT_DIR
 from utils.csv_logger import init_csv, log_event
-from utils.dedup import EventDeduplicator
+from utils.json_logger import init_json, log_json_event
+from utils.config import OUTPUT_DIR
 from utils.drawing import draw_box
+from utils.dedup import EventDeduplicator
 
-# ------------------------------------------------------------------
-# FastAPI app
-# ------------------------------------------------------------------
-app = FastAPI(
-    title="Kakinada Traffic AI Analytics",
-    docs_url="/docs",
-    redoc_url="/redoc",
-    openapi_url="/openapi.json",
-)
+app = FastAPI(title="Traffic & Public Safety AI")
 
-# ------------------------------------------------------------------
-# CORS (REQUIRED for Vercel frontend)
-# ------------------------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://video-ten-silk.vercel.app",
-        "http://localhost:3000",
-    ],
-    allow_credentials=True,
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ------------------------------------------------------------------
-# Ensure output directory exists
-# ------------------------------------------------------------------
 OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
 
-# ------------------------------------------------------------------
-# Load pipelines once (important for performance)
-# ------------------------------------------------------------------
 vehicle_tracker = VehicleTracker()
 helmet_detector = HelmetDetector()
 weapon_detector = WeaponDetector()
@@ -70,59 +40,46 @@ fight_detector = FightDetector()
 event_manager = EventManager()
 dedup = EventDeduplicator()
 
-# ------------------------------------------------------------------
-# Health check
-# ------------------------------------------------------------------
 @app.get("/")
 def health():
-    return {
-        "status": "running",
-        "service": "Traffic AI FastAPI",
-    }
+    return {"status": "running"}
 
-# ------------------------------------------------------------------
-# Main analysis endpoint
-# ------------------------------------------------------------------
-@app.post("/analyze", summary="Analyze traffic video")
-async def analyze_video(
-    file: UploadFile = File(..., description="Upload MP4/AVI/MOV/MKV/WEBM video"),
-):
-    if not file.filename.lower().endswith(
-        (".mp4", ".avi", ".mov", ".mkv", ".webm")
-    ):
-        raise HTTPException(status_code=400, detail="Unsupported video format")
+@app.post("/analyze")
+async def analyze_video(file: UploadFile = File(...)):
+    if not file.filename.lower().endswith((".mp4", ".avi", ".mov", ".mkv", ".webm")):
+        raise HTTPException(400, "Unsupported video format")
 
     run_id = str(uuid.uuid4())[:8]
 
     input_path = OUTPUT_DIR / f"input_{run_id}.mp4"
     output_path = OUTPUT_DIR / f"output_{run_id}.mp4"
     csv_path = OUTPUT_DIR / f"events_{run_id}.csv"
+    json_path = OUTPUT_DIR / f"events_{run_id}.json"
 
-    # Save uploaded file
     with open(input_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
     cap = cv2.VideoCapture(str(input_path))
     if not cap.isOpened():
-        raise HTTPException(status_code=500, detail="Failed to open video")
+        raise HTTPException(500, "Video open failed")
 
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    fps = fps if fps and fps > 0 else 25
-
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
     writer = cv2.VideoWriter(
         str(output_path),
         cv2.VideoWriter_fourcc(*"mp4v"),
         fps,
-        (width, height),
+        (w, h),
     )
 
     init_csv(csv_path)
-    frame_id = 0
+    init_json(json_path)
 
-    # --------------------- frame loop ---------------------
+    frame_id = 0
+    CAMERA_ID = "CAM_01"
+
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -140,18 +97,38 @@ async def analyze_video(
 
             for ev in events:
                 key = f"{t['track_id']}-{ev['type']}"
+                if not dedup.allow(key):
+                    continue
 
-                if dedup.allow(key):
-                    log_event(
-                        csv_path,
-                        [
-                            frame_id,
-                            ev["type"],
-                            t["track_id"],
-                            ev["confidence"],
-                            ev["details"],
-                        ],
-                    )
+                common = dict(
+                    detection_uuid=str(uuid.uuid4()),
+                    file_name=input_path.name,
+                    camera_id=CAMERA_ID,
+                    frame_id=frame_id,
+                    object_id=t["track_id"],
+                    lane=t.get("lane"),
+                    speed_kmph=t.get("speed"),
+                    overspeed=ev["type"] == "overspeed",
+                    label=ev["label"],
+                    confidence=ev["confidence"],
+                    color=ev["color"],
+                    helmet_violation=ev["type"] == "helmet_violation",
+                    weapon_detected=ev["type"] == "weapon",
+                    fight_detected=ev["type"] == "fight",
+                    fight_confidence=ev.get("confidence"),
+                    fight_participants=ev.get("participants"),
+                    fight_severity=ev.get("severity"),
+                    fight_duration_sec=ev.get("duration"),
+                    violation_type=ev["type"],
+                    anpr_plate=ev.get("plate"),
+                    anpr_confidence=ev.get("plate_conf"),
+                    hotlist_match=ev.get("hotlist", False),
+                    violation_image=ev.get("evidence_path"),
+                    meta={"pipeline": "traffic-ai-v1"},
+                )
+
+                log_event(csv_path, **common)
+                log_json_event(json_path, **common)
 
                 draw_box(frame, t["bbox"], ev["label"], ev["color"])
 
@@ -160,27 +137,21 @@ async def analyze_video(
     cap.release()
     writer.release()
 
-    return JSONResponse(
-        {
-            "status": "success",
-            "video": f"/download/video/{output_path.name}",
-            "csv": f"/download/csv/{csv_path.name}",
-        }
-    )
+    return {
+        "status": "success",
+        "video": f"/download/video/{output_path.name}",
+        "csv": f"/download/csv/{csv_path.name}",
+        "json": f"/download/json/{json_path.name}",
+    }
 
-# ------------------------------------------------------------------
-# Download endpoints
-# ------------------------------------------------------------------
-@app.get("/download/video/{filename}")
-def download_video(filename: str):
-    path = OUTPUT_DIR / filename
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="Video not found")
-    return FileResponse(path, media_type="video/mp4")
+@app.get("/download/video/{name}")
+def download_video(name: str):
+    return FileResponse(OUTPUT_DIR / name, media_type="video/mp4")
 
-@app.get("/download/csv/{filename}")
-def download_csv(filename: str):
-    path = OUTPUT_DIR / filename
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="CSV not found")
-    return FileResponse(path, media_type="text/csv")
+@app.get("/download/csv/{name}")
+def download_csv(name: str):
+    return FileResponse(OUTPUT_DIR / name, media_type="text/csv")
+
+@app.get("/download/json/{name}")
+def download_json(name: str):
+    return FileResponse(OUTPUT_DIR / name, media_type="application/json")
