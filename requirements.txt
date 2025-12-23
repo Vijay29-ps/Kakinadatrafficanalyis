@@ -1,10 +1,19 @@
+# API
 fastapi
 uvicorn
+python-multipart
+python-dotenv
+
+# Vision / AI
 ultralytics==8.3.235
-opencv-python-headless
-numpy
-pandas
 torch
 torchvision
-python-multipart
+opencv-python-headless
 Pillow
+numpy
+pandas
+scipy
+ffmpeg-python
+
+# System / Monitoring
+psutil
